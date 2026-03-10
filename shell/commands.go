@@ -4,9 +4,11 @@ import (
 	"bufio"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -756,6 +758,227 @@ Usage: FIND [/I] [/N] [/C] "string" file...`)
 }
 
 // ---------------------------------------------------------------------------
+// FINDSTR – grep-like search supporting regex and multiple patterns
+// ---------------------------------------------------------------------------
+
+func (s *Shell) cmdFindstr(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, `FINDSTR: Missing required parameter.
+Usage: FINDSTR [/B] [/E] [/L] [/R] [/S] [/I] [/N] [/M] [/C:"string"] [/G:file]
+       [strings] filename...
+  /B       Match at beginning of line.
+  /E       Match at end of line.
+  /L       Uses search strings literally (default).
+  /R       Uses search strings as regular expressions.
+  /S       Searches for matching files in current dir and all subdirs.
+  /I       Case-insensitive search.
+  /N       Print the line number before each matching line.
+  /M       Print only the filename if a file contains a match.
+  /C:str   Use the specified string as a literal search string.
+  /G:file  Gets search strings from the specified file.`)
+		s.code = 1
+		return
+	}
+
+	matchBegin := false
+	matchEnd := false
+	useRegex := false
+	recursive := false
+	caseInsensitive := false
+	showLineNums := false
+	filenameOnly := false
+	var patterns []string
+	var files []string
+
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		upper := strings.ToUpper(a)
+		switch {
+		case upper == "/B":
+			matchBegin = true
+		case upper == "/E":
+			matchEnd = true
+		case upper == "/L":
+			useRegex = false
+		case upper == "/R":
+			useRegex = true
+		case upper == "/S":
+			recursive = true
+		case upper == "/I":
+			caseInsensitive = true
+		case upper == "/N":
+			showLineNums = true
+		case upper == "/M":
+			filenameOnly = true
+		case strings.HasPrefix(upper, "/C:"):
+			patterns = append(patterns, a[3:])
+		case strings.HasPrefix(upper, "/G:"):
+			gfile := s.absPath(a[3:])
+			data, err := os.ReadFile(gfile)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "FINDSTR: Cannot open %s\n", a[3:])
+				s.code = 1
+				return
+			}
+			for _, line := range strings.Split(string(data), "\n") {
+				if t := strings.TrimRight(line, "\r"); t != "" {
+					patterns = append(patterns, t)
+				}
+			}
+		default:
+			if len(patterns) == 0 && !strings.HasPrefix(a, "/") {
+				// First non-flag arg is the search pattern(s) — space-separated.
+				patterns = append(patterns, strings.Fields(a)...)
+			} else {
+				files = append(files, a)
+			}
+		}
+	}
+
+	if len(patterns) == 0 {
+		fmt.Fprintln(os.Stderr, "FINDSTR: Missing required parameter.")
+		s.code = 1
+		return
+	}
+
+	// Build regex or literal matchers.
+	type matcher struct {
+		re      *regexp.Regexp
+		literal string
+	}
+	var matchers []matcher
+	for _, p := range patterns {
+		if useRegex {
+			flags := ""
+			if caseInsensitive {
+				flags = "(?i)"
+			}
+			re, err := regexp.Compile(flags + p)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "FINDSTR: Invalid regular expression: %s\n", p)
+				s.code = 2
+				return
+			}
+			matchers = append(matchers, matcher{re: re})
+		} else {
+			matchers = append(matchers, matcher{literal: p})
+		}
+	}
+
+	lineMatches := func(line string) bool {
+		for _, m := range matchers {
+			var matched bool
+			if m.re != nil {
+				check := line
+				if matchBegin {
+					check = "^" + regexp.QuoteMeta(line)
+				}
+				_ = check
+				matched = m.re.MatchString(line)
+				if matchBegin {
+					loc := m.re.FindStringIndex(line)
+					matched = loc != nil && loc[0] == 0
+				}
+				if matchEnd && matched {
+					loc := m.re.FindStringIndex(line)
+					matched = loc != nil && loc[1] == len(line)
+				}
+			} else {
+				needle := m.literal
+				haystack := line
+				if caseInsensitive {
+					needle = strings.ToLower(needle)
+					haystack = strings.ToLower(line)
+				}
+				if matchBegin {
+					matched = strings.HasPrefix(haystack, needle)
+				} else if matchEnd {
+					matched = strings.HasSuffix(haystack, needle)
+				} else {
+					matched = strings.Contains(haystack, needle)
+				}
+			}
+			if matched {
+				return true
+			}
+		}
+		return false
+	}
+
+	searchFile := func(path, displayName string) bool {
+		f, err := os.Open(path)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "FINDSTR: Cannot open %s\n", displayName)
+			return false
+		}
+		defer f.Close()
+
+		found := false
+		scanner := bufio.NewScanner(f)
+		lineNum := 0
+		for scanner.Scan() {
+			lineNum++
+			line := scanner.Text()
+			if lineMatches(line) {
+				found = true
+				if filenameOnly {
+					fmt.Println(displayName)
+					return true
+				}
+				prefix := ""
+				if showLineNums {
+					prefix = fmt.Sprintf("%d:", lineNum)
+				}
+				fmt.Printf("%s%s\n", prefix, line)
+			}
+		}
+		return found
+	}
+
+	// Collect target files (supporting globs and recursive).
+	var targets []struct{ abs, display string }
+	for _, pat := range files {
+		abs := s.absPath(pat)
+		if recursive {
+			// Walk from the directory part of the pattern.
+			dir := filepath.Dir(abs)
+			glob := filepath.Base(abs)
+			filepath.WalkDir(dir, func(p string, d fs.DirEntry, err error) error { //nolint
+				if err != nil || d.IsDir() {
+					return nil
+				}
+				matched, _ := filepath.Match(glob, d.Name())
+				if matched || glob == d.Name() || glob == "*" || glob == "*.*" {
+					targets = append(targets, struct{ abs, display string }{p, p})
+				}
+				return nil
+			})
+		} else {
+			matches, _ := filepath.Glob(abs)
+			if len(matches) == 0 {
+				matches = []string{abs}
+			}
+			for _, m := range matches {
+				targets = append(targets, struct{ abs, display string }{m, m})
+			}
+		}
+	}
+
+	anyMatch := false
+	for _, t := range targets {
+		if searchFile(t.abs, t.display) {
+			anyMatch = true
+		}
+	}
+
+	if !anyMatch {
+		s.code = 1
+	} else {
+		s.code = 0
+	}
+}
+
+// ---------------------------------------------------------------------------
 // TREE
 // ---------------------------------------------------------------------------
 
@@ -887,6 +1110,7 @@ ECHO      Displays messages, or turns command-echoing on or off.
 ERASE     Deletes one or more files.
 EXIT      Quits the shell.
 FIND      Searches for a text string in a file or files.
+FINDSTR   Searches for strings in files (supports regex, recursive).
 HELP      Provides Help information for commands.
 MD        Creates a directory.
 MKDIR     Creates a directory.
@@ -918,7 +1142,13 @@ func (s *Shell) helpFor(cmd string) {
 		"MOVE":   "MOVE source destination\n  Moves files from one location to another.",
 		"REN":    "REN oldname newname\n  Renames a file.",
 		"TYPE":   "TYPE filename\n  Displays the contents of a text file.",
-		"FIND":   `FIND [/I] [/N] [/C] "string" filename...`,
+		"FIND":    `FIND [/I] [/N] [/C] "string" filename...`,
+		"FINDSTR": "FINDSTR [/B] [/E] [/L] [/R] [/S] [/I] [/N] [/M] [/C:str] [/G:file] strings filename...\n" +
+			"  /B  Match at beginning of line.   /E  Match at end of line.\n" +
+			"  /R  Use regular expressions.      /S  Search subdirectories.\n" +
+			"  /I  Case insensitive.             /N  Print line numbers.\n" +
+			"  /M  Print filenames only.         /C  Literal search string.\n" +
+			"  /G  Read patterns from file.",
 		"TREE":   "TREE [path] [/F]\n  /F  Display the names of the files in each folder.",
 		"SET":    "SET [variable[=value]]\n  Displays or sets environment variables.",
 		"ECHO":   "ECHO [message]\n  Displays a message or turns echo on/off.",

@@ -306,6 +306,8 @@ func (s *Shell) execute(line string) {
 		s.cmdAttrib(args)
 	case "FIND":
 		s.cmdFind(args)
+	case "FINDSTR":
+		s.cmdFindstr(args)
 	case "MORE":
 		s.cmdMore(args)
 	case "DOSKEY":
