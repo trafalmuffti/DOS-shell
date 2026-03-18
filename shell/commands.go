@@ -1055,6 +1055,67 @@ func (s *Shell) cmdPause() {
 }
 
 // ---------------------------------------------------------------------------
+// MEM – display memory usage (reads /proc/meminfo)
+// ---------------------------------------------------------------------------
+
+func (s *Shell) cmdMem() {
+	f, err := os.Open("/proc/meminfo")
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "MEM: unable to read memory information.")
+		s.code = 1
+		return
+	}
+	defer f.Close()
+
+	info := make(map[string]uint64)
+	scanner := bufio.NewScanner(f)
+	for scanner.Scan() {
+		line := scanner.Text()
+		var key string
+		var val uint64
+		if _, err := fmt.Sscanf(line, "%s %d", &key, &val); err != nil {
+			continue
+		}
+		key = strings.TrimSuffix(key, ":")
+		info[key] = val // values are in kB
+	}
+
+	totalKB := info["MemTotal"]
+	freeKB := info["MemAvailable"] // "available" is the practical free figure
+	if freeKB == 0 {
+		freeKB = info["MemFree"]
+	}
+	usedKB := totalKB - freeKB
+
+	toBytes := func(kb uint64) uint64 { return kb * 1024 }
+
+	fmt.Println()
+	fmt.Printf(" Memory Type       Total        Used        Free\n")
+	fmt.Printf(" ----------------  -----------  ----------  -----------\n")
+	fmt.Printf(" Physical Memory   %11s  %10s  %11s\n",
+		formatSize(int64(toBytes(totalKB))),
+		formatSize(int64(toBytes(usedKB))),
+		formatSize(int64(toBytes(freeKB))))
+
+	// Show swap if present.
+	swapTotal := info["SwapTotal"]
+	swapFree := info["SwapFree"]
+	swapUsed := swapTotal - swapFree
+	if swapTotal > 0 {
+		fmt.Printf(" Swap / Page File  %11s  %10s  %11s\n",
+			formatSize(int64(toBytes(swapTotal))),
+			formatSize(int64(toBytes(swapUsed))),
+			formatSize(int64(toBytes(swapFree))))
+	}
+	fmt.Println()
+	fmt.Printf(" Total memory:     %s\n", formatSize(int64(toBytes(totalKB))))
+	fmt.Printf(" Total in use:     %s\n", formatSize(int64(toBytes(usedKB))))
+	fmt.Printf(" Total free:       %s\n", formatSize(int64(toBytes(freeKB))))
+	fmt.Println()
+	s.code = 0
+}
+
+// ---------------------------------------------------------------------------
 // DOSKEY – define macros
 // ---------------------------------------------------------------------------
 
@@ -1114,6 +1175,7 @@ FINDSTR   Searches for strings in files (supports regex, recursive).
 HELP      Provides Help information for commands.
 MD        Creates a directory.
 MKDIR     Creates a directory.
+MEM       Displays the amount of used and free memory.
 MORE      Displays output one screen at a time.
 MOVE      Moves files and renames files and directories.
 PATH      Displays or sets a search path for executable files.
@@ -1153,6 +1215,7 @@ func (s *Shell) helpFor(cmd string) {
 		"SET":    "SET [variable[=value]]\n  Displays or sets environment variables.",
 		"ECHO":   "ECHO [message]\n  Displays a message or turns echo on/off.",
 		"MKDIR":  "MD directory\n  Creates a directory.",
+		"MEM":    "MEM\n  Displays total physical memory, memory in use, and free memory.",
 		"RMDIR":  "RD [/S] directory\n  Removes a directory. /S removes all subdirectories.",
 		"EXIT":   "EXIT [/B] [exitcode]\n  Exits the shell.",
 		"DOSKEY": "DOSKEY [name=macro]\n  Creates macros and recalls command history.",

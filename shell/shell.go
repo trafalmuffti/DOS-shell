@@ -300,6 +300,8 @@ func (s *Shell) execute(line string) {
 		s.cmdTime()
 	case "PAUSE":
 		s.cmdPause()
+	case "MEM":
+		s.cmdMem()
 	case "TREE":
 		s.cmdTree(args)
 	case "ATTRIB":
