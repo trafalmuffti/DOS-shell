@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"io/fs"
+	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -1045,6 +1046,70 @@ func printTree(path, prefix string, showFiles bool) {
 }
 
 // ---------------------------------------------------------------------------
+// DL – download a file from a URI
+// ---------------------------------------------------------------------------
+
+func (s *Shell) cmdDl(args []string) {
+	if len(args) == 0 {
+		fmt.Fprintln(os.Stderr, "Usage: DL <uri> [destination]")
+		s.code = 1
+		return
+	}
+
+	uri := args[0]
+
+	// Determine destination filename.
+	dest := ""
+	if len(args) >= 2 {
+		dest = args[1]
+	} else {
+		// Derive from the URI path (last segment).
+		dest = uri[strings.LastIndexAny(uri, "/\\")+1:]
+		if q := strings.Index(dest, "?"); q >= 0 {
+			dest = dest[:q]
+		}
+		if dest == "" {
+			dest = "download"
+		}
+	}
+	dest = s.absPath(dest)
+
+	fmt.Printf("Downloading %s\n", uri)
+
+	resp, err := http.Get(uri) //nolint:noctx
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "DL: %v\n", err)
+		s.code = 1
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		fmt.Fprintf(os.Stderr, "DL: server returned %s\n", resp.Status)
+		s.code = 1
+		return
+	}
+
+	out, err := os.Create(dest)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "DL: cannot create %s: %v\n", dest, err)
+		s.code = 1
+		return
+	}
+	defer out.Close()
+
+	written, err := io.Copy(out, resp.Body)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "DL: error writing file: %v\n", err)
+		s.code = 1
+		return
+	}
+
+	fmt.Printf("Saved %s (%s bytes)\n", dest, formatSize(written))
+	s.code = 0
+}
+
+// ---------------------------------------------------------------------------
 // PAUSE
 // ---------------------------------------------------------------------------
 
@@ -1165,6 +1230,7 @@ CLS       Clears the screen.
 COPY      Copies one or more files to another location.
 DATE      Displays or sets the date.
 DEL       Deletes one or more files.
+DL        Downloads a file from a URI.
 DIR       Displays a list of files and subdirectories in a directory.
 DOSKEY    Edits command lines and creates macros.
 ECHO      Displays messages, or turns command-echoing on or off.
@@ -1218,6 +1284,7 @@ func (s *Shell) helpFor(cmd string) {
 		"MEM":    "MEM\n  Displays total physical memory, memory in use, and free memory.",
 		"RMDIR":  "RD [/S] directory\n  Removes a directory. /S removes all subdirectories.",
 		"EXIT":   "EXIT [/B] [exitcode]\n  Exits the shell.",
+		"DL":     "DL <uri> [destination]\n  Downloads a file from the given URI.\n  If destination is omitted the filename is inferred from the URI.",
 		"DOSKEY": "DOSKEY [name=macro]\n  Creates macros and recalls command history.",
 	}
 	if m, ok := msgs[cmd]; ok {

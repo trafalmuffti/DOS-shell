@@ -312,6 +312,8 @@ func (s *Shell) execute(line string) {
 		s.cmdFindstr(args)
 	case "MORE":
 		s.cmdMore(args)
+	case "DL":
+		s.cmdDl(args)
 	case "DOSKEY":
 		s.cmdDoskey(args)
 	case "CALL":
