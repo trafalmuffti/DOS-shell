@@ -3,9 +3,12 @@ package shell
 
 import (
 	"bufio"
+	cryptorand "crypto/rand"
 	"fmt"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 )
 
@@ -18,6 +21,7 @@ type Shell struct {
 	cwd     string            // current working directory
 	exit    bool              // set to true to exit
 	code    int               // exit code
+	rng     *rand.Rand        // ChaCha8-backed RNG for %RANDOM%
 }
 
 // New creates and initializes a new Shell.
@@ -27,10 +31,18 @@ func New() *Shell {
 		cwd = "/"
 	}
 
+	var seed [32]byte
+	if _, err := cryptorand.Read(seed[:]); err != nil {
+		// Fallback: leave seed as zero — ChaCha8 still works.
+		_ = err
+	}
+	chacha := rand.NewChaCha8(seed)
+
 	s := &Shell{
 		env:     make(map[string]string),
 		aliases: make(map[string]string),
 		cwd:     cwd,
+		rng:     rand.New(chacha),
 	}
 
 	// Seed env from the OS environment.
@@ -182,7 +194,12 @@ func (s *Shell) expandVars(line string) string {
 			j := strings.Index(line[i+1:], "%")
 			if j >= 0 {
 				name := strings.ToUpper(line[i+1 : i+1+j])
-				val := s.env[name]
+				var val string
+				if name == "RANDOM" {
+					val = strconv.Itoa(s.rng.IntN(32768))
+				} else {
+					val = s.env[name]
+				}
 				b.WriteString(val)
 				i += j + 1
 				continue
