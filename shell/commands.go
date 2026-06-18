@@ -42,21 +42,13 @@ func (s *Shell) cmdVer() {
 // DATE / TIME
 // ---------------------------------------------------------------------------
 
-func dateString() string {
-	return time.Now().Format("Mon 01/02/2006")
-}
-
-func timeString() string {
-	return time.Now().Format("15:04:05.00")
-}
-
 func (s *Shell) cmdDate() {
-	fmt.Printf("The current date is: %s\n", dateString())
+	fmt.Printf("The current date is: %s\n", time.Now().Format("Mon 01/02/2006"))
 	s.code = 0
 }
 
 func (s *Shell) cmdTime() {
-	fmt.Printf("The current time is: %s\n", timeString())
+	fmt.Printf("The current time is: %s\n", time.Now().Format("15:04:05.00"))
 	s.code = 0
 }
 
