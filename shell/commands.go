@@ -42,13 +42,16 @@ func (s *Shell) cmdVer() {
 // DATE / TIME
 // ---------------------------------------------------------------------------
 
+func dateString() string { return time.Now().Format("Mon 01/02/2006") }
+func timeString() string { return time.Now().Format("15:04:05.00") }
+
 func (s *Shell) cmdDate() {
-	fmt.Printf("The current date is: %s\n", time.Now().Format("Mon 01/02/2006"))
+	fmt.Printf("The current date is: %s\n", dateString())
 	s.code = 0
 }
 
 func (s *Shell) cmdTime() {
-	fmt.Printf("The current time is: %s\n", time.Now().Format("15:04:05.00"))
+	fmt.Printf("The current time is: %s\n", timeString())
 	s.code = 0
 }
 
@@ -695,7 +698,9 @@ Usage: FIND [/I] [/N] [/C] "string" file...`)
 		case "/C":
 			countOnly = true
 		default:
-			if strings.HasPrefix(a, `"`) || strings.HasPrefix(a, "'") {
+			// The tokenizer already strips surrounding quotes; treat the first
+			// non-flag token as the search string and the rest as filenames.
+			if searchStr == "" {
 				searchStr = strings.Trim(a, `"'`)
 			} else {
 				files = append(files, a)

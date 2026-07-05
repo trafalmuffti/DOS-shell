@@ -215,12 +215,17 @@ func (s *Shell) executePipeline(line string) {
 	// We do a simple token scan to respect quoted strings.
 	cmds := splitCommands(line)
 	prevOK := true
+	prevOp := ""
 	for _, seg := range cmds {
-		if seg.op == "&&" && !prevOK {
+		// op is stored on the LEFT segment of each operator, so to decide
+		// whether to run THIS segment we check the previous segment's op.
+		if prevOp == "&&" && !prevOK {
+			prevOp = seg.op
 			continue
 		}
 		s.execute(strings.TrimSpace(seg.cmd))
 		prevOK = (s.code == 0)
+		prevOp = seg.op
 	}
 }
 
