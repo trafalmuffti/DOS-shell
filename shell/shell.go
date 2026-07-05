@@ -16,12 +16,24 @@ const version = "DOS Shell 1.0 [Linux]"
 
 // Shell holds the state of the running shell.
 type Shell struct {
-	env     map[string]string // environment variables
-	aliases map[string]string // DOSKEY-style macros
-	cwd     string            // current working directory
-	exit    bool              // set to true to exit
-	code    int               // exit code
-	rng     *rand.Rand        // ChaCha8-backed RNG for %RANDOM%
+	env      map[string]string // environment variables
+	aliases  map[string]string // DOSKEY-style macros
+	cwd      string            // current working directory
+	exit     bool              // set to true to exit
+	code     int               // exit code
+	rng      *rand.Rand        // ChaCha8-backed RNG for %RANDOM%
+	params   []string          // batch positional parameters (%0..%n)
+	delayed  bool              // delayed !VAR! expansion enabled (SETLOCAL)
+	local    []localScope      // SETLOCAL/ENDLOCAL stack
+	pushd    []string          // PUSHD/POPD directory stack
+	curBatch *batchProcessor   // batch file currently executing (nil if interactive)
+}
+
+// localScope is one SETLOCAL frame: a snapshot of the environment restored on
+// the matching ENDLOCAL.
+type localScope struct {
+	env     map[string]string
+	delayed bool
 }
 
 // New creates and initializes a new Shell.
@@ -68,9 +80,10 @@ func (s *Shell) Run(args []string) {
 	case len(args) >= 2 && strings.EqualFold(args[0], "/K"):
 		// Execute command then drop into interactive mode.
 		s.executeLineWithEcho(strings.Join(args[1:], " "), false)
-	case len(args) == 1 && !strings.HasPrefix(args[0], "/"):
-		// Treat a single arg as a batch file.
-		s.runBatchFile(args[0])
+	case len(args) >= 1 && !strings.EqualFold(args[0], "/C") && !strings.EqualFold(args[0], "/K"):
+		// Treat the first arg as a batch file and the rest as its parameters.
+		// (A leading "/" is fine here — on Linux that is just an absolute path.)
+		s.runBatchFile(args[0], args[1:]...)
 		os.Exit(s.code)
 	}
 
@@ -170,56 +183,271 @@ func (s *Shell) executeLineWithEcho(line string, echo bool) {
 	}
 
 	line = strings.TrimSpace(line)
+
+	// Comments: REM ... and the label-style :: ...
+	if line == "" || isRem(line) || strings.HasPrefix(line, "::") {
+		return
+	}
+
+	// IF and FOR must be parsed BEFORE %-expansion so that FOR loop variables
+	// (%%v) and comparison operands survive intact.
+	upper := strings.ToUpper(line)
+	if isWord(upper, "IF") {
+		if echo && !noEcho {
+			fmt.Printf("%s%s\n", s.prompt(), line)
+		}
+		s.evalIf(line, s.curBatch)
+		return
+	}
+	if isWord(upper, "FOR") {
+		if echo && !noEcho {
+			fmt.Printf("%s%s\n", s.prompt(), line)
+		}
+		s.evalFor(line, s.curBatch)
+		return
+	}
+
+	// %VAR%, %1, %~dp0, %VAR:~a,b%, %VAR:x=y% expansion.
+	line = s.expandVars(line)
+	// !VAR! delayed expansion, when enabled by SETLOCAL ENABLEDELAYEDEXPANSION.
+	if s.delayed {
+		line = s.expandDelayed(line)
+	}
+
 	if echo && !noEcho && line != "" {
 		fmt.Printf("%s%s\n", s.prompt(), line)
 	}
 
-	if line == "" || strings.HasPrefix(line, "REM ") || strings.HasPrefix(line, "rem ") || strings.EqualFold(line, "REM") {
-		return
-	}
-
-	// Expand environment variables (%VAR%).
-	line = s.expandVars(line)
-
-	// Split into individual commands separated by &&, & or |.
-	// For simplicity we support & (sequential) and && (on-success).
+	// Split into individual commands separated by &, && and ||.
 	s.executePipeline(line)
 }
 
-// expandVars replaces %VAR% references with their values.
+// isRem reports whether a line is a REM comment.
+func isRem(line string) bool {
+	if len(line) < 3 {
+		return strings.EqualFold(line, "rem")
+	}
+	if !strings.EqualFold(line[:3], "rem") {
+		return false
+	}
+	return len(line) == 3 || line[3] == ' ' || line[3] == '\t'
+}
+
+// expandVars performs %-expansion: literal %%, positional parameters (%0..%9,
+// %*, %~modifiers), dynamic variables, substring (%V:~a,b%) and substitution
+// (%V:x=y%) forms, and plain %NAME%.
 func (s *Shell) expandVars(line string) string {
 	var b strings.Builder
-	for i := 0; i < len(line); i++ {
-		if line[i] == '%' {
-			j := strings.Index(line[i+1:], "%")
-			if j >= 0 {
-				name := strings.ToUpper(line[i+1 : i+1+j])
-				var val string
-				if name == "RANDOM" {
-					val = strconv.Itoa(s.rng.IntN(32768))
-				} else {
-					val = s.env[name]
-				}
-				b.WriteString(val)
-				i += j + 1
+	i := 0
+	for i < len(line) {
+		c := line[i]
+		if c != '%' {
+			b.WriteByte(c)
+			i++
+			continue
+		}
+		// %% -> literal %
+		if i+1 < len(line) && line[i+1] == '%' {
+			b.WriteByte('%')
+			i += 2
+			continue
+		}
+		// %* -> all parameters
+		if i+1 < len(line) && line[i+1] == '*' {
+			b.WriteString(s.paramStar())
+			i += 2
+			continue
+		}
+		// %<digit> -> positional parameter
+		if i+1 < len(line) && line[i+1] >= '0' && line[i+1] <= '9' {
+			b.WriteString(s.param(int(line[i+1]-'0'), ""))
+			i += 2
+			continue
+		}
+		// %~modifiers<digit> -> modified positional parameter
+		if i+1 < len(line) && line[i+1] == '~' {
+			j := i + 2
+			for j < len(line) && isModChar(line[j]) {
+				j++
+			}
+			if j < len(line) && line[j] >= '0' && line[j] <= '9' {
+				mods := line[i+2 : j]
+				b.WriteString(s.param(int(line[j]-'0'), mods))
+				i = j + 1
 				continue
 			}
+			// Not a parameter reference — emit literally.
+			b.WriteByte('%')
+			i++
+			continue
 		}
-		b.WriteByte(line[i])
+		// %NAME%, %NAME:~a,b%, %NAME:x=y%
+		if end := strings.IndexByte(line[i+1:], '%'); end >= 0 {
+			inner := line[i+1 : i+1+end]
+			b.WriteString(s.expandNamed(inner))
+			i = i + 1 + end + 1
+			continue
+		}
+		// Unterminated % — literal.
+		b.WriteByte('%')
+		i++
 	}
 	return b.String()
 }
 
-// executePipeline handles & and && command chaining.
+// expandDelayed performs !VAR!, !VAR:~a,b! and !VAR:x=y! expansion.
+func (s *Shell) expandDelayed(line string) string {
+	var b strings.Builder
+	i := 0
+	for i < len(line) {
+		if line[i] == '!' {
+			if end := strings.IndexByte(line[i+1:], '!'); end >= 0 {
+				inner := line[i+1 : i+1+end]
+				b.WriteString(s.expandNamed(inner))
+				i = i + 1 + end + 1
+				continue
+			}
+		}
+		b.WriteByte(line[i])
+		i++
+	}
+	return b.String()
+}
+
+// isModChar reports whether c is a valid %~ modifier letter.
+func isModChar(c byte) bool {
+	switch c {
+	case 'f', 'd', 'p', 'n', 'x', 's', 'a', 't', 'z':
+		return true
+	}
+	return false
+}
+
+// expandNamed resolves the text between a pair of % (or !) delimiters, handling
+// substring and substitution modifiers.
+func (s *Shell) expandNamed(inner string) string {
+	if ci := strings.IndexByte(inner, ':'); ci >= 0 {
+		name := inner[:ci]
+		spec := inner[ci+1:]
+		base := s.lookup(name)
+		if strings.HasPrefix(spec, "~") {
+			return substring(base, spec[1:])
+		}
+		// Substitution: find=replace (case-insensitive on find, like cmd).
+		if eq := strings.IndexByte(spec, '='); eq >= 0 {
+			find := spec[:eq]
+			repl := spec[eq+1:]
+			return substitute(base, find, repl)
+		}
+		return base
+	}
+	return s.lookup(inner)
+}
+
+// lookup resolves a variable name, including cmd's dynamic pseudo-variables.
+func (s *Shell) lookup(name string) string {
+	switch strings.ToUpper(name) {
+	case "RANDOM":
+		return strconv.Itoa(s.rng.IntN(32768))
+	case "ERRORLEVEL":
+		return strconv.Itoa(s.code)
+	case "CD":
+		return s.dosPath(s.cwd)
+	case "DATE":
+		return dateString()
+	case "TIME":
+		return timeString()
+	case "CMDCMDLINE":
+		return version
+	}
+	return s.env[strings.ToUpper(name)]
+}
+
+// substring implements the %VAR:~start,len% offset syntax.
+func substring(base, spec string) string {
+	r := []rune(base)
+	n := len(r)
+	start, length := 0, n
+	hasLen := false
+	if comma := strings.IndexByte(spec, ','); comma >= 0 {
+		start, _ = strconv.Atoi(strings.TrimSpace(spec[:comma]))
+		length, _ = strconv.Atoi(strings.TrimSpace(spec[comma+1:]))
+		hasLen = true
+	} else {
+		start, _ = strconv.Atoi(strings.TrimSpace(spec))
+	}
+	if start < 0 {
+		start = n + start
+		if start < 0 {
+			start = 0
+		}
+	}
+	if start > n {
+		return ""
+	}
+	end := n
+	if hasLen {
+		if length < 0 {
+			end = n + length
+		} else {
+			end = start + length
+		}
+	}
+	if end > n {
+		end = n
+	}
+	if end < start {
+		return ""
+	}
+	return string(r[start:end])
+}
+
+// substitute implements %VAR:find=replace% (case-insensitive find). A find that
+// begins with * replaces everything up to and including the first match.
+func substitute(base, find, repl string) string {
+	if find == "" {
+		return base
+	}
+	if strings.HasPrefix(find, "*") {
+		needle := find[1:]
+		if needle == "" {
+			return base
+		}
+		if idx := indexFold(base, needle); idx >= 0 {
+			return repl + base[idx+len(needle):]
+		}
+		return base
+	}
+	// Case-insensitive replace-all.
+	var b strings.Builder
+	for {
+		idx := indexFold(base, find)
+		if idx < 0 {
+			b.WriteString(base)
+			break
+		}
+		b.WriteString(base[:idx])
+		b.WriteString(repl)
+		base = base[idx+len(find):]
+	}
+	return b.String()
+}
+
+// executePipeline handles &, && and || command chaining.
 func (s *Shell) executePipeline(line string) {
-	// We do a simple token scan to respect quoted strings.
 	cmds := splitCommands(line)
 	prevOK := true
 	prevOp := ""
 	for _, seg := range cmds {
 		// op is stored on the LEFT segment of each operator, so to decide
-		// whether to run THIS segment we check the previous segment's op.
+		// whether to run THIS segment we check the previous segment's op:
+		//   &&  run only if the previous command succeeded
+		//   ||  run only if the previous command failed
 		if prevOp == "&&" && !prevOK {
+			prevOp = seg.op
+			continue
+		}
+		if prevOp == "||" && prevOK {
 			prevOp = seg.op
 			continue
 		}
@@ -231,24 +459,50 @@ func (s *Shell) executePipeline(line string) {
 
 type cmdSeg struct {
 	cmd string
-	op  string // "" | "&" | "&&"
+	op  string // "" | "&" | "&&" | "||"
 }
 
-// splitCommands splits a line on & and && operators (outside quotes).
+// splitCommands splits a line on &, && and || operators (outside quotes and
+// outside parenthesised blocks, and respecting the ^ escape character).
 func splitCommands(line string) []cmdSeg {
 	var segs []cmdSeg
 	var buf strings.Builder
 	inQ := false
+	depth := 0
 	i := 0
 	for i < len(line) {
 		c := line[i]
+		if c == '^' && i+1 < len(line) {
+			// Caret escapes the next character.
+			buf.WriteByte(line[i+1])
+			i += 2
+			continue
+		}
 		if c == '"' {
 			inQ = !inQ
 			buf.WriteByte(c)
 			i++
 			continue
 		}
-		if !inQ && c == '&' {
+		if !inQ && c == '(' {
+			depth++
+			buf.WriteByte(c)
+			i++
+			continue
+		}
+		if !inQ && c == ')' && depth > 0 {
+			depth--
+			buf.WriteByte(c)
+			i++
+			continue
+		}
+		if !inQ && depth == 0 && c == '|' && i+1 < len(line) && line[i+1] == '|' {
+			segs = append(segs, cmdSeg{cmd: buf.String(), op: "||"})
+			buf.Reset()
+			i += 2
+			continue
+		}
+		if !inQ && depth == 0 && c == '&' {
 			if i+1 < len(line) && line[i+1] == '&' {
 				segs = append(segs, cmdSeg{cmd: buf.String(), op: "&&"})
 				buf.Reset()
@@ -267,10 +521,33 @@ func splitCommands(line string) []cmdSeg {
 	return segs
 }
 
-// execute dispatches a single command.
+// execute runs a single command, applying any I/O redirection it carries.
 func (s *Shell) execute(line string) {
+	if strings.TrimSpace(line) == "" {
+		return
+	}
+	cmd, redir := parseRedirection(line)
+	if redir == nil {
+		s.dispatch(cmd)
+		return
+	}
+	s.runWithRedirection(cmd, redir)
+}
+
+// dispatch tokenises and runs a single command with no redirection handling.
+func (s *Shell) dispatch(line string) {
 	if line == "" {
 		return
+	}
+
+	// ECHO. and ECHO: (and ECHO(): print the remainder verbatim, or a blank
+	// line, without the intervening separator character.
+	if len(line) >= 5 && strings.EqualFold(line[:4], "ECHO") {
+		if c := line[4]; c == '.' || c == ':' || c == '(' {
+			fmt.Println(line[5:])
+			s.code = 0
+			return
+		}
 	}
 
 	tokens := tokenize(line)
@@ -340,6 +617,24 @@ func (s *Shell) execute(line string) {
 		s.cmdDoskey(args)
 	case "CALL":
 		s.cmdCall(args)
+	case "IF":
+		s.evalIf(line, s.curBatch)
+	case "FOR":
+		s.evalFor(line, s.curBatch)
+	case "GOTO":
+		s.cmdGoto(args)
+	case "SETLOCAL":
+		s.cmdSetlocal(args)
+	case "ENDLOCAL":
+		s.cmdEndlocal()
+	case "SHIFT":
+		s.cmdShift(args)
+	case "PUSHD":
+		s.cmdPushd(args)
+	case "POPD":
+		s.cmdPopd()
+	case "TITLE":
+		s.code = 0 // window title has no meaning here; accept silently
 	case "HELP", "/?":
 		s.cmdHelp(args)
 	case "EXIT":

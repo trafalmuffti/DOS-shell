@@ -100,7 +100,26 @@ func (s *Shell) cmdSet(args []string) {
 		return
 	}
 
+	// SET /A expression  — evaluate arithmetic.
+	if strings.EqualFold(args[0], "/A") {
+		s.setArithmetic(strings.Join(args[1:], " "))
+		return
+	}
+
+	// SET /P var=prompt  — read a line of input into var.
+	if strings.EqualFold(args[0], "/P") {
+		s.setPrompt(strings.Join(args[1:], " "))
+		return
+	}
+
 	expr := strings.Join(args, " ")
+
+	// SET "VAR=value" — quotes wrap the whole assignment; strip them so the
+	// value does not include a trailing quote.
+	if strings.HasPrefix(expr, `"`) && strings.HasSuffix(expr, `"`) && len(expr) >= 2 {
+		expr = expr[1 : len(expr)-1]
+	}
+
 	eq := strings.Index(expr, "=")
 	if eq < 0 {
 		// Display variables matching prefix.
@@ -123,11 +142,11 @@ func (s *Shell) cmdSet(args []string) {
 	val := expr[eq+1:]
 	if val == "" {
 		delete(s.env, key)
+		os.Unsetenv(key)
 	} else {
 		s.env[key] = val
+		os.Setenv(key, val) // keep OS env in sync for child processes
 	}
-	// Keep OS env in sync for child processes.
-	os.Setenv(key, val)
 	s.code = 0
 }
 
@@ -1231,11 +1250,15 @@ DL        Downloads a file from a URI.
 DIR       Displays a list of files and subdirectories in a directory.
 DOSKEY    Edits command lines and creates macros.
 ECHO      Displays messages, or turns command-echoing on or off.
+ENDLOCAL  Ends localization of environment changes in a batch file.
 ERASE     Deletes one or more files.
-EXIT      Quits the shell.
+EXIT      Quits the shell (EXIT /B returns from a batch script).
 FIND      Searches for a text string in a file or files.
 FINDSTR   Searches for strings in files (supports regex, recursive).
+FOR       Runs a command for each item in a set (/L /F /D /R supported).
+GOTO      Directs batch processing to a labelled line.
 HELP      Provides Help information for commands.
+IF        Performs conditional processing in batch programs.
 MD        Creates a directory.
 MKDIR     Creates a directory.
 MEM       Displays the amount of used and free memory.
@@ -1243,16 +1266,25 @@ MORE      Displays output one screen at a time.
 MOVE      Moves files and renames files and directories.
 PATH      Displays or sets a search path for executable files.
 PAUSE     Suspends processing of a batch program and displays a message.
+POPD      Restores the directory saved by PUSHD.
+PUSHD     Saves the current directory then changes to a new one.
 RD        Removes a directory.
 REM       Records comments (remarks) in batch files.
 REN       Renames a file or files.
 RENAME    Renames a file or files.
 RMDIR     Removes a directory.
-SET       Displays, sets, or removes environment variables.
+SET       Displays or sets variables (SET /A arithmetic, SET /P prompt).
+SETLOCAL  Begins localization of environment changes in a batch file.
+SHIFT     Shifts the position of batch parameters.
 TIME      Displays or sets the system time.
 TREE      Graphically displays the directory structure of a drive or path.
 TYPE      Displays the contents of a text file.
 VER       Displays the version.
+
+Batch scripts (.bat/.cmd) also support: positional parameters (%1..%9,
+%*, %~dp0), CALL :label subroutines, GOTO :EOF, delayed !VAR! expansion,
+IF EQU/NEQ/LSS/LEQ/GTR/GEQ and ELSE blocks, and I/O redirection
+(>, >>, <, 2>, 2>&1, NUL).
 
 `)
 	s.code = 0
@@ -1260,14 +1292,14 @@ VER       Displays the version.
 
 func (s *Shell) helpFor(cmd string) {
 	msgs := map[string]string{
-		"DIR":    "DIR [drive:][path][filename] [/W] [/B]\n  /W  Wide list format.\n  /B  Bare format (no heading or summary).",
-		"CD":     "CD [path]\n  Changes the current directory.",
-		"COPY":   "COPY source destination\n  Copies files from source to destination.",
-		"DEL":    "DEL [/Q] filename\n  Deletes files. /Q quiet mode.",
-		"MOVE":   "MOVE source destination\n  Moves files from one location to another.",
-		"REN":    "REN oldname newname\n  Renames a file.",
-		"TYPE":   "TYPE filename\n  Displays the contents of a text file.",
-		"FIND":    `FIND [/I] [/N] [/C] "string" filename...`,
+		"DIR":  "DIR [drive:][path][filename] [/W] [/B]\n  /W  Wide list format.\n  /B  Bare format (no heading or summary).",
+		"CD":   "CD [path]\n  Changes the current directory.",
+		"COPY": "COPY source destination\n  Copies files from source to destination.",
+		"DEL":  "DEL [/Q] filename\n  Deletes files. /Q quiet mode.",
+		"MOVE": "MOVE source destination\n  Moves files from one location to another.",
+		"REN":  "REN oldname newname\n  Renames a file.",
+		"TYPE": "TYPE filename\n  Displays the contents of a text file.",
+		"FIND": `FIND [/I] [/N] [/C] "string" filename...`,
 		"FINDSTR": "FINDSTR [/B] [/E] [/L] [/R] [/S] [/I] [/N] [/M] [/C:str] [/G:file] strings filename...\n" +
 			"  /B  Match at beginning of line.   /E  Match at end of line.\n" +
 			"  /R  Use regular expressions.      /S  Search subdirectories.\n" +
@@ -1293,44 +1325,18 @@ func (s *Shell) helpFor(cmd string) {
 }
 
 // ---------------------------------------------------------------------------
-// EXIT
-// ---------------------------------------------------------------------------
-
-func (s *Shell) cmdExit(args []string) {
-	code := 0
-	for _, a := range args {
-		if n, err := strconv.Atoi(a); err == nil {
-			code = n
-		}
-	}
-	s.code = code
-	s.exit = true
-}
-
-// ---------------------------------------------------------------------------
-// CALL – call a batch file from within a batch file
-// ---------------------------------------------------------------------------
-
-func (s *Shell) cmdCall(args []string) {
-	if len(args) == 0 {
-		s.code = 0
-		return
-	}
-	s.runBatchFile(args[0])
-}
-
-// ---------------------------------------------------------------------------
 // External command / program execution
 // ---------------------------------------------------------------------------
 
 func (s *Shell) runExternal(tokens []string) bool {
 	name := tokens[0]
 
-	// Check if it's a batch file.
-	if strings.HasSuffix(strings.ToLower(name), ".bat") {
+	// Check if it's a batch file (.bat or .cmd are equivalent in cmd.exe).
+	lower := strings.ToLower(name)
+	if strings.HasSuffix(lower, ".bat") || strings.HasSuffix(lower, ".cmd") {
 		path := s.absPath(name)
 		if _, err := os.Stat(path); err == nil {
-			s.runBatchFile(path)
+			s.runBatchFile(path, tokens[1:]...)
 			return true
 		}
 	}
@@ -1368,193 +1374,6 @@ func (s *Shell) runExternal(tokens []string) bool {
 		s.code = 0
 	}
 	return true
-}
-
-// ---------------------------------------------------------------------------
-// Batch file execution
-// ---------------------------------------------------------------------------
-
-func (s *Shell) runBatchFile(path string) {
-	abs := s.absPath(path)
-	data, err := os.ReadFile(abs)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "The system cannot find the file specified.\n")
-		s.code = 1
-		return
-	}
-
-	lines := strings.Split(string(data), "\n")
-	bp := &batchProcessor{
-		shell: s,
-		lines: lines,
-		pc:    0,
-	}
-	bp.run()
-}
-
-// batchProcessor tracks state for a running batch file.
-type batchProcessor struct {
-	shell *Shell
-	lines []string
-	pc    int
-	echo  bool
-}
-
-func (bp *batchProcessor) run() {
-	bp.echo = true
-	for bp.pc < len(bp.lines) && !bp.shell.exit {
-		line := strings.TrimRight(bp.lines[bp.pc], "\r")
-		bp.pc++
-
-		trimmed := strings.TrimSpace(line)
-
-		// Handle GOTO.
-		if strings.HasPrefix(strings.ToUpper(trimmed), "GOTO ") {
-			label := strings.TrimSpace(trimmed[5:])
-			bp.gotoLabel(label)
-			continue
-		}
-
-		// Handle IF.
-		if strings.HasPrefix(strings.ToUpper(trimmed), "IF ") {
-			bp.handleIf(trimmed)
-			continue
-		}
-
-		// Handle FOR.
-		if strings.HasPrefix(strings.ToUpper(trimmed), "FOR ") {
-			bp.handleFor(trimmed)
-			continue
-		}
-
-		// Handle @ECHO ON/OFF.
-		upper := strings.ToUpper(trimmed)
-		if upper == "ECHO ON" || upper == "@ECHO ON" {
-			bp.echo = true
-			continue
-		}
-		if upper == "ECHO OFF" || upper == "@ECHO OFF" {
-			bp.echo = false
-			continue
-		}
-
-		bp.shell.executeLineWithEcho(line, bp.echo)
-	}
-}
-
-func (bp *batchProcessor) gotoLabel(label string) {
-	target := ":" + strings.ToLower(label)
-	for i, l := range bp.lines {
-		if strings.ToLower(strings.TrimSpace(l)) == target {
-			bp.pc = i + 1
-			return
-		}
-	}
-	fmt.Fprintf(os.Stderr, "Label not found - %s\n", label)
-	bp.shell.code = 1
-}
-
-func (bp *batchProcessor) handleIf(line string) {
-	// Supported syntax:
-	//   IF [NOT] ERRORLEVEL n command
-	//   IF [NOT] EXIST file command
-	//   IF [NOT] "a"=="b" command
-	rest := line[3:] // strip IF
-	rest = strings.TrimSpace(rest)
-
-	not := false
-	if strings.HasPrefix(strings.ToUpper(rest), "NOT ") {
-		not = true
-		rest = strings.TrimSpace(rest[4:])
-	}
-
-	upper := strings.ToUpper(rest)
-	var condition bool
-	var cmd string
-
-	switch {
-	case strings.HasPrefix(upper, "ERRORLEVEL "):
-		parts := strings.SplitN(rest[11:], " ", 2)
-		if len(parts) < 2 {
-			return
-		}
-		n, _ := strconv.Atoi(strings.TrimSpace(parts[0]))
-		condition = bp.shell.code >= n
-		cmd = parts[1]
-
-	case strings.HasPrefix(upper, "EXIST "):
-		parts := strings.SplitN(rest[6:], " ", 2)
-		if len(parts) < 2 {
-			return
-		}
-		path := bp.shell.absPath(strings.TrimSpace(parts[0]))
-		_, err := os.Stat(path)
-		condition = (err == nil)
-		cmd = parts[1]
-
-	default:
-		// String comparison: "a"=="b" or a==b
-		idx := strings.Index(rest, "==")
-		if idx < 0 {
-			return
-		}
-		lhs := strings.Trim(strings.TrimSpace(rest[:idx]), `"`)
-		afterEq := strings.TrimSpace(rest[idx+2:])
-		// The command follows the second operand.
-		// operand ends at first space that is not inside quotes.
-		rhs, remainder := splitFirstToken(afterEq)
-		rhs = strings.Trim(rhs, `"`)
-		condition = (lhs == rhs)
-		cmd = remainder
-	}
-
-	if not {
-		condition = !condition
-	}
-	if condition {
-		bp.shell.executeLineWithEcho(strings.TrimSpace(cmd), false)
-	}
-}
-
-// splitFirstToken splits a string into the first whitespace-delimited token
-// and the remainder.
-func splitFirstToken(s string) (string, string) {
-	s = strings.TrimSpace(s)
-	i := strings.IndexByte(s, ' ')
-	if i < 0 {
-		return s, ""
-	}
-	return s[:i], strings.TrimSpace(s[i+1:])
-}
-
-func (bp *batchProcessor) handleFor(line string) {
-	// FOR %%var IN (list) DO command
-	// Simplified: only supports literal lists.
-	upper := strings.ToUpper(line)
-	inIdx := strings.Index(upper, " IN (")
-	doIdx := strings.Index(upper, ") DO ")
-	if inIdx < 0 || doIdx < 0 {
-		fmt.Fprintln(os.Stderr, "The syntax of the command is incorrect.")
-		return
-	}
-
-	// Extract variable name: FOR %%v ...
-	varPart := strings.TrimSpace(line[4:inIdx])
-	if len(varPart) < 2 || varPart[0] != '%' {
-		fmt.Fprintln(os.Stderr, "The syntax of the command is incorrect.")
-		return
-	}
-	varName := string(varPart[1])
-
-	listStr := line[inIdx+5 : doIdx]
-	cmd := strings.TrimSpace(line[doIdx+5:])
-
-	items := strings.Fields(listStr)
-	for _, item := range items {
-		expanded := strings.ReplaceAll(cmd, "%"+varName, item)
-		expanded = strings.ReplaceAll(expanded, "%%"+varName, item)
-		bp.shell.executeLineWithEcho(expanded, false)
-	}
 }
 
 // ---------------------------------------------------------------------------

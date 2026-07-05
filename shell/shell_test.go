@@ -98,16 +98,16 @@ func TestSplitCommands(t *testing.T) {
 	}
 }
 
-func TestSplitFirstToken(t *testing.T) {
-	tok, rest := splitFirstToken("hello world more")
+func TestFirstToken(t *testing.T) {
+	tok, rest := firstToken("hello world more")
 	if tok != "hello" || rest != "world more" {
 		t.Errorf("got %q, %q", tok, rest)
 	}
-	tok2, rest2 := splitFirstToken("single")
+	tok2, rest2 := firstToken("single")
 	if tok2 != "single" || rest2 != "" {
 		t.Errorf("got %q, %q", tok2, rest2)
 	}
-	tok3, rest3 := splitFirstToken("")
+	tok3, rest3 := firstToken("")
 	if tok3 != "" || rest3 != "" {
 		t.Errorf("got %q, %q", tok3, rest3)
 	}
